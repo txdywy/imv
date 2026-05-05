@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { generateRoomId } from "@/lib/utils";
 
@@ -8,20 +8,10 @@ export default function Home() {
   const router = useRouter();
   const [roomCode, setRoomCode] = useState("");
   const [error, setError] = useState("");
-  const [storageWarning, setStorageWarning] = useState("");
-
-  useEffect(() => {
-    fetch("/api/status")
-      .then((r) => r.json())
-      .then((d) => {
-        if (!d.ready) setStorageWarning("Database not connected. Go to Vercel → Storage → Create → Upstash Redis, then connect it to this project and redeploy.");
-      })
-      .catch(() => {});
-  }, []);
 
   const createRoom = () => {
     const id = generateRoomId();
-    router.push(`/room/${id}?init=true`);
+    router.push(`/room/${id}`);
   };
 
   const joinRoom = () => {
@@ -46,11 +36,6 @@ export default function Home() {
         </div>
 
         <div className="space-y-4">
-          {storageWarning && (
-            <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-200">
-              {storageWarning}
-            </div>
-          )}
           <button
             onClick={createRoom}
             className="w-full h-12 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90 transition-opacity"
@@ -63,9 +48,7 @@ export default function Home() {
               <div className="w-full border-t border-border" />
             </div>
             <div className="relative flex justify-center text-xs">
-              <span className="bg-background px-2 text-muted-foreground">
-                or join
-              </span>
+              <span className="bg-background px-2 text-muted-foreground">or join</span>
             </div>
           </div>
 
@@ -75,24 +58,17 @@ export default function Home() {
                 type="text"
                 placeholder="Room code"
                 value={roomCode}
-                onChange={(e) => {
-                  setRoomCode(e.target.value.toUpperCase());
-                  setError("");
-                }}
+                onChange={(e) => { setRoomCode(e.target.value.toUpperCase()); setError(""); }}
                 onKeyDown={(e) => e.key === "Enter" && joinRoom()}
                 maxLength={6}
                 className="flex-1 h-12 rounded-lg border border-border bg-card px-4 text-center text-lg font-mono tracking-widest placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-ring"
               />
-              <button
-                onClick={joinRoom}
-                className="h-12 px-6 rounded-lg border border-border font-medium hover:bg-muted transition-colors"
-              >
+              <button onClick={joinRoom}
+                className="h-12 px-6 rounded-lg border border-border font-medium hover:bg-muted transition-colors">
                 Join
               </button>
             </div>
-            {error && (
-              <p className="text-sm text-destructive text-center">{error}</p>
-            )}
+            {error && <p className="text-sm text-destructive text-center">{error}</p>}
           </div>
         </div>
 
