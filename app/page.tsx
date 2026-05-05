@@ -14,7 +14,7 @@ export default function Home() {
     fetch("/api/status")
       .then((r) => r.json())
       .then((d) => {
-        if (!d.ready) setStorageWarning("Vercel KV not configured — rooms won't persist across requests. Add KV_REST_API_URL in Vercel dashboard.");
+        if (!d.ready) setStorageWarning("Database not connected. Go to Vercel → Storage → Create → Upstash Redis, then connect it to this project and redeploy.");
       })
       .catch(() => {});
   }, []);
