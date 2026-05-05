@@ -23,13 +23,16 @@ async function getData(roomId: string): Promise<SignalData | null> {
   return null;
 }
 
-async function setData(roomId: string, data: SignalData) {
+async function setData(roomId: string, data: SignalData): Promise<boolean> {
   const r = getRedis();
   if (r) {
     await r.set(`sig:${roomId}`, data, { ex: SIGNAL_TTL });
+    return true;
   } else if (isDev) {
     memoryStore.set(`sig:${roomId}`, data);
+    return true;
   }
+  return false;
 }
 
 export async function POST(req: NextRequest) {
@@ -41,16 +44,16 @@ export async function POST(req: NextRequest) {
   }
 
   if (action === "answer") {
-    await setData(roomId, { answer: body.sdp, candidates: [] });
-    return NextResponse.json({ ok: true, stored: !!getRedis() });
+    const stored = await setData(roomId, { answer: body.sdp, candidates: [] });
+    return NextResponse.json({ ok: true, stored });
   }
 
   if (action === "candidate") {
     const data = (await getData(roomId)) || {};
     if (!data.candidates) data.candidates = [];
     data.candidates.push(body.candidate);
-    await setData(roomId, data);
-    return NextResponse.json({ ok: true, stored: !!getRedis() });
+    const stored = await setData(roomId, data);
+    return NextResponse.json({ ok: true, stored });
   }
 
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });

@@ -1,16 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Simple rate limiting via Edge Proxy
+// Simple rate limiting via Next.js Proxy.
 const rateLimit = new Map<string, { count: number; resetAt: number }>();
 const MAX_REQUESTS = 30;
-const WINDOW_MS = 10_000; // 10 seconds
+const WINDOW_MS = 10_000;
 
-export function middleware(req: NextRequest) {
-  // Only rate-limit API routes
-  if (!req.nextUrl.pathname.startsWith("/api/")) {
-    return NextResponse.next();
-  }
-
+export function proxy(req: NextRequest) {
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0] || "unknown";
   const now = Date.now();
   const entry = rateLimit.get(ip);
