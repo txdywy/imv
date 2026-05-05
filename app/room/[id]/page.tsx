@@ -8,7 +8,7 @@ import type { ChatMessage, FileTransferProgress } from "@/lib/types";
 import { playNotification } from "@/lib/sound";
 import { encodeOfferLink, decodeOfferFromHash, encodeAnswerHash, decodeAnswerFromHash } from "@/lib/signal-url";
 
-type ConnectionState = "idle" | "creating-offer" | "waiting-answer" | "connecting" | "connected" | "receiving-answer";
+type ConnectionState = "idle" | "creating-offer" | "waiting-answer" | "connecting" | "connected";
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -25,6 +25,7 @@ export default function RoomPage() {
   const [fileProgress, setFileProgress] = useState<Map<string, FileTransferProgress>>(new Map());
   const [receivedFiles, setReceivedFiles] = useState<File[]>([]);
   const [shareLink, setShareLink] = useState("");
+  const [answerLink, setAnswerLink] = useState("");
   const [copied, setCopied] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
@@ -35,6 +36,7 @@ export default function RoomPage() {
   const ftRef = useRef<FileTransferManager | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const addMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, msg]);
@@ -68,6 +70,8 @@ export default function RoomPage() {
     channel.onopen = () => {
       setState("connected");
       setShareLink("");
+      setAnswerLink("");
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       addMessage({
         id: nanoid(8), from: "system",
         text: "Connected. Messages are end-to-end encrypted.",
@@ -102,10 +106,26 @@ export default function RoomPage() {
   const createPeerConnection = useCallback((iceServers?: RTCIceServer[]) => {
     const pc = new RTCPeerConnection({ iceServers: iceServers || ICE_SERVERS });
     pcRef.current = pc;
-    return pc;
-  }, []);
 
-  // Creator: create offer and show share link
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        // Try to store candidate via API (best effort)
+        fetch("/api/signal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "candidate", roomId, candidate: event.candidate.toJSON() }),
+        }).catch(() => {});
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") setState("connected");
+    };
+
+    return pc;
+  }, [roomId]);
+
+  // Creator: create offer, show share link, poll for answer
   const createRoom = useCallback(async () => {
     setState("creating-offer");
     setError("");
@@ -117,40 +137,31 @@ export default function RoomPage() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // POST offer to API
-    const res = await fetch("/api/signal", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "offer", roomId, sdp: offer }),
-    });
-    if (!res.ok) {
-      setError("Failed to create room");
-      setState("idle");
-      return;
-    }
-
     const link = encodeOfferLink(window.location.origin, roomId, offer, ICE_SERVERS);
     setShareLink(link);
     setState("waiting-answer");
 
-    // Poll for answer
-    const poll = setInterval(async () => {
+    // Poll for answer (works if Redis is configured)
+    pollRef.current = setInterval(async () => {
       try {
         const r = await fetch(`/api/signal?roomId=${roomId}`);
         const data = await r.json();
         if (data.answer) {
-          clearInterval(poll);
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
           await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
           setState("connecting");
         }
+        // Also poll ICE candidates
+        if (data.candidates?.length) {
+          for (const c of data.candidates) {
+            await pc.addIceCandidate(new RTCIceCandidate(c));
+          }
+        }
       } catch { /* keep polling */ }
     }, 1000);
-
-    // Timeout after 5 minutes
-    setTimeout(() => clearInterval(poll), 300_000);
   }, [roomId, createPeerConnection, setupDataChannel]);
 
-  // Joiner: extract offer from URL hash, create answer
+  // Joiner: extract offer from URL, create answer
   const joinRoom = useCallback(async () => {
     const hashData = decodeOfferFromHash(window.location.hash);
     if (!hashData) {
@@ -158,9 +169,7 @@ export default function RoomPage() {
       return;
     }
 
-    setState("receiving-answer");
     setError("");
-
     const pc = createPeerConnection(hashData.ice);
     pc.ondatachannel = (event) => setupDataChannel(event.channel);
 
@@ -168,22 +177,28 @@ export default function RoomPage() {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    // POST answer to API
-    const res = await fetch("/api/signal", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "answer", roomId, sdp: answer }),
-    });
-    if (!res.ok) {
-      setError("Failed to send answer");
-      setState("idle");
-      return;
-    }
+    // Try to POST answer to API
+    try {
+      const res = await fetch("/api/signal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "answer", roomId, sdp: answer }),
+      });
+      const result = await res.json();
+      if (result.stored) {
+        // API stored the answer — creator will poll it
+        setState("connecting");
+        return;
+      }
+    } catch { /* API unavailable */ }
 
+    // Fallback: show answer link for manual copy-paste
+    const aLink = `${window.location.origin}/room/${roomId}${encodeAnswerHash(answer)}`;
+    setAnswerLink(aLink);
     setState("connecting");
   }, [roomId, createPeerConnection, setupDataChannel]);
 
-  // Auto-detect role on mount
+  // Auto-detect role
   useEffect(() => {
     const ft = new FileTransferManager({
       send: (data) => { dcRef.current?.send(data); return true; },
@@ -193,43 +208,27 @@ export default function RoomPage() {
     });
     ftRef.current = ft;
 
+    // Check if there's an answer in the hash (creator received answer link)
+    const answer = decodeAnswerFromHash(window.location.hash);
+    if (answer && pcRef.current) {
+      pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      setState("connecting");
+      return;
+    }
+
     if (window.location.hash.startsWith("#offer=")) {
       setIsJoiner(true);
       joinRoom();
     }
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [joinRoom, updateProgress, handleFileReady]);
 
-  // ICE candidate exchange via API
-  useEffect(() => {
-    const pc = pcRef.current;
-    if (!pc) return;
-
-    pc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        // Trickle ICE: store candidate with the room
-        await fetch("/api/signal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "candidate",
-            roomId,
-            candidate: event.candidate.toJSON(),
-          }),
-        });
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "connected") {
-        setState("connected");
-      }
-    };
-  }, [roomId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Poll for ICE candidates (for the offerer side)
+  // Poll for ICE candidates when connecting
   useEffect(() => {
     if (state !== "waiting-answer" && state !== "connecting") return;
-
     const pc = pcRef.current;
     if (!pc) return;
 
@@ -237,7 +236,7 @@ export default function RoomPage() {
       try {
         const r = await fetch(`/api/signal?roomId=${roomId}`);
         const data = await r.json();
-        if (data.candidates) {
+        if (data.candidates?.length) {
           for (const c of data.candidates) {
             await pc.addIceCandidate(new RTCIceCandidate(c));
           }
@@ -252,10 +251,7 @@ export default function RoomPage() {
     const text = inputText.trim();
     if (!text || state !== "connected" || !dcRef.current) return;
     dcRef.current.send(text);
-    addMessage({
-      id: nanoid(8), from: "self", text,
-      timestamp: Date.now(), type: "chat",
-    });
+    addMessage({ id: nanoid(8), from: "self", text, timestamp: Date.now(), type: "chat" });
     setInputText("");
   };
 
@@ -266,8 +262,8 @@ export default function RoomPage() {
     }
   };
 
-  const copyLink = () => {
-    navigator.clipboard.writeText(shareLink);
+  const copyText = (text: string) => {
+    navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -275,9 +271,7 @@ export default function RoomPage() {
   const downloadFile = (file: File) => {
     const url = URL.createObjectURL(file);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = file.name;
-    a.click();
+    a.href = url; a.download = file.name; a.click();
     URL.revokeObjectURL(url);
   };
 
@@ -289,10 +283,7 @@ export default function RoomPage() {
       className="flex flex-col flex-1 h-screen relative"
       onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
       onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
-      onDrop={(e) => {
-        e.preventDefault(); setIsDragging(false);
-        if (e.dataTransfer.files.length) sendFile(e.dataTransfer.files);
-      }}
+      onDrop={(e) => { e.preventDefault(); setIsDragging(false); if (e.dataTransfer.files.length) sendFile(e.dataTransfer.files); }}
     >
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center">
@@ -305,63 +296,63 @@ export default function RoomPage() {
       <header className="h-14 border-b border-border flex items-center justify-between px-4 shrink-0">
         <h1 className="font-bold text-lg">IMV</h1>
         <div className="flex items-center gap-2">
-          <div className={`h-2 w-2 rounded-full ${
-            isConnected ? "bg-green-400" : isWaiting ? "bg-yellow-400 animate-pulse" : "bg-muted-foreground"
-          }`} />
-          <span className={`text-sm ${
-            isConnected ? "text-green-400" : isWaiting ? "text-yellow-400" : "text-muted-foreground"
-          }`}>
-            {isConnected ? "Connected" : isWaiting ? "Waiting for peer..." : state === "connecting" ? "Connecting..." : "Ready"}
+          <div className={`h-2 w-2 rounded-full ${isConnected ? "bg-green-400" : isWaiting ? "bg-yellow-400 animate-pulse" : "bg-muted-foreground"}`} />
+          <span className={`text-sm ${isConnected ? "text-green-400" : isWaiting ? "text-yellow-400" : "text-muted-foreground"}`}>
+            {isConnected ? "Connected" : isWaiting ? "Waiting..." : state === "connecting" ? "Connecting..." : "Ready"}
           </span>
         </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        {/* Waiting state: show share link */}
+        {/* Share link for creator */}
         {isWaiting && shareLink && (
-          <div className="text-center py-16 space-y-4">
+          <div className="text-center py-12 space-y-4">
             <p className="text-muted-foreground">Share this link with your peer:</p>
-            <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono">
+            <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono max-w-lg mx-auto">
               {shareLink}
             </div>
-            <button
-              onClick={copyLink}
-              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90"
-            >
+            <button onClick={() => copyText(shareLink)}
+              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
               {copied ? "Copied!" : "Copy Link"}
             </button>
           </div>
         )}
 
-        {/* Idle state: show create button */}
+        {/* Answer link fallback (when no Redis) */}
+        {answerLink && (
+          <div className="text-center py-8 space-y-4">
+            <p className="text-muted-foreground">Connection answer ready. Copy this link and send it to the creator:</p>
+            <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono max-w-lg mx-auto">
+              {answerLink}
+            </div>
+            <button onClick={() => copyText(answerLink)}
+              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
+              {copied ? "Copied!" : "Copy Answer Link"}
+            </button>
+          </div>
+        )}
+
+        {/* Idle state */}
         {state === "idle" && !isJoiner && (
           <div className="text-center py-20 space-y-4">
             <p className="text-muted-foreground">Create a room to start chatting</p>
-            <button
-              onClick={createRoom}
-              className="px-6 py-3 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90"
-            >
+            <button onClick={createRoom}
+              className="px-6 py-3 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90">
               Create Room
             </button>
           </div>
         )}
 
-        {error && (
-          <div className="text-center text-destructive text-sm">{error}</div>
-        )}
+        {error && <div className="text-center text-destructive text-sm">{error}</div>}
 
         {messages.map((msg) => (
-          <div key={msg.id} className={`flex ${
-            msg.from === "self" ? "justify-end" : msg.from === "system" ? "justify-center" : "justify-start"
-          }`}>
+          <div key={msg.id} className={`flex ${msg.from === "self" ? "justify-end" : msg.from === "system" ? "justify-center" : "justify-start"}`}>
             {msg.type === "system" ? (
               <span className="text-xs text-muted-foreground bg-muted px-3 py-1 rounded-full">{msg.text}</span>
             ) : (
-              <div className={`max-w-[75%] px-3.5 py-2 rounded-2xl text-sm ${
-                msg.from === "self"
-                  ? "bg-primary text-primary-foreground rounded-br-md"
-                  : "bg-card border border-border rounded-bl-md"
-              }`}>{msg.text}</div>
+              <div className={`max-w-[75%] px-3.5 py-2 rounded-2xl text-sm ${msg.from === "self" ? "bg-primary text-primary-foreground rounded-br-md" : "bg-card border border-border rounded-bl-md"}`}>
+                {msg.text}
+              </div>
             )}
           </div>
         ))}
@@ -370,28 +361,19 @@ export default function RoomPage() {
         {Array.from(fileProgress.values()).map((fp) => (
           <div key={fp.fileId} className="bg-card border border-border rounded-lg p-3 mx-4">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium truncate max-w-[200px]">
-                {fp.direction === "send" ? "↑" : "↓"} {fp.fileName}
-              </span>
-              <span className="text-xs text-muted-foreground">
-                {formatBytes(fp.direction === "send" ? fp.sent : fp.received)} / {formatBytes(fp.fileSize)}
-              </span>
+              <span className="text-sm font-medium truncate max-w-[200px]">{fp.direction === "send" ? "↑" : "↓"} {fp.fileName}</span>
+              <span className="text-xs text-muted-foreground">{formatBytes(fp.direction === "send" ? fp.sent : fp.received)} / {formatBytes(fp.fileSize)}</span>
             </div>
             <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-              <div className="h-full bg-primary transition-all duration-200 rounded-full" style={{
-                width: `${fp.fileSize > 0 ? ((fp.direction === "send" ? fp.sent : fp.received) / fp.fileSize) * 100 : 0}%`
-              }} />
+              <div className="h-full bg-primary transition-all duration-200 rounded-full" style={{ width: `${fp.fileSize > 0 ? ((fp.direction === "send" ? fp.sent : fp.received) / fp.fileSize) * 100 : 0}%` }} />
             </div>
           </div>
         ))}
 
         {receivedFiles.map((file, i) => (
           <div key={`${file.name}-${i}`} className="flex justify-center">
-            <button onClick={() => downloadFile(file)}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-card border border-border text-sm hover:bg-muted transition-colors">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
+            <button onClick={() => downloadFile(file)} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-card border border-border text-sm hover:bg-muted transition-colors">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
               Download {file.name} ({formatBytes(file.size)})
             </button>
           </div>
@@ -401,21 +383,13 @@ export default function RoomPage() {
       <div className="border-t border-border p-3 shrink-0">
         <div className="flex gap-2 items-end">
           <input type="file" ref={fileInputRef} onChange={(e) => e.target.files && sendFile(e.target.files)} className="hidden" multiple />
-          <button onClick={() => fileInputRef.current?.click()} disabled={!isConnected}
-            className="h-10 w-10 rounded-lg border border-border flex items-center justify-center hover:bg-muted transition-colors disabled:opacity-30" title="Send file">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
-            </svg>
+          <button onClick={() => fileInputRef.current?.click()} disabled={!isConnected} className="h-10 w-10 rounded-lg border border-border flex items-center justify-center hover:bg-muted transition-colors disabled:opacity-30" title="Send file">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
           </button>
-          <input type="text" value={inputText} onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-            placeholder={isConnected ? "Type a message..." : "Waiting for connection..."}
-            disabled={!isConnected}
+          <input type="text" value={inputText} onChange={(e) => setInputText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+            placeholder={isConnected ? "Type a message..." : "Waiting for connection..."} disabled={!isConnected}
             className="flex-1 h-10 rounded-lg border border-border bg-card px-3.5 text-sm placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-30" />
-          <button onClick={sendMessage} disabled={!isConnected || !inputText.trim()}
-            className="h-10 px-4 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-30">
-            Send
-          </button>
+          <button onClick={sendMessage} disabled={!isConnected || !inputText.trim()} className="h-10 px-4 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-30">Send</button>
         </div>
       </div>
     </div>

@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+
+// Stateless signaling — this endpoint exists only for the POST-answer flow.
+// The offer is embedded in the URL hash. The answer is POSTed here and
+// returned via polling. Uses Upstash Redis if available, memory otherwise.
+// If neither works, the client falls back to URL-only mode (copy answer link).
+
 import { getRedis } from "@/lib/redis";
 
 interface SignalData {
-  offer?: unknown;
   answer?: unknown;
   candidates?: unknown[];
 }
@@ -35,16 +40,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "roomId required" }, { status: 400 });
   }
 
-  if (action === "offer") {
-    await setData(roomId, { offer: body.sdp, candidates: [] });
-    return NextResponse.json({ ok: true });
-  }
-
   if (action === "answer") {
-    const data = (await getData(roomId)) || {};
-    data.answer = body.sdp;
-    await setData(roomId, data);
-    return NextResponse.json({ ok: true });
+    await setData(roomId, { answer: body.sdp, candidates: [] });
+    return NextResponse.json({ ok: true, stored: !!getRedis() });
   }
 
   if (action === "candidate") {
@@ -52,7 +50,7 @@ export async function POST(req: NextRequest) {
     if (!data.candidates) data.candidates = [];
     data.candidates.push(body.candidate);
     await setData(roomId, data);
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, stored: !!getRedis() });
   }
 
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
@@ -65,5 +63,11 @@ export async function GET(req: NextRequest) {
   const data = await getData(roomId);
   if (!data) return NextResponse.json({});
 
-  return NextResponse.json(data);
+  // Return and clear candidates
+  const result: SignalData = { ...data };
+  if (data.candidates?.length) {
+    data.candidates = [];
+    await setData(roomId, data);
+  }
+  return NextResponse.json(result);
 }
