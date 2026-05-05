@@ -57,6 +57,26 @@ export function decodeAnswerFromHash(hash: string): RTCSessionDescriptionInit | 
   }
 }
 
+export function encodeAnswerText(answer: RTCSessionDescriptionInit): string {
+  return encodeAnswerHash(answer).slice("#answer=".length);
+}
+
+export function decodeAnswerFromText(text: string): RTCSessionDescriptionInit | null {
+  const value = text.trim();
+  if (!value) return null;
+
+  try {
+    const hash = value.startsWith("http://") || value.startsWith("https://")
+      ? new URL(value).hash
+      : value.startsWith("#answer=")
+        ? value
+        : `#answer=${value.replace(/^answer=/, "")}`;
+    return decodeAnswerFromHash(hash);
+  } catch {
+    return null;
+  }
+}
+
 function toBase64(encoded: string): string {
   const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
   return base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");

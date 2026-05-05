@@ -6,7 +6,13 @@ import { nanoid } from "nanoid";
 import { FileTransferManager } from "@/lib/file-transfer";
 import type { ChatMessage, FileTransferProgress } from "@/lib/types";
 import { playNotification } from "@/lib/sound";
-import { encodeOfferLink, decodeOfferFromHash, encodeAnswerHash, decodeAnswerFromHash } from "@/lib/signal-url";
+import {
+  decodeAnswerFromHash,
+  decodeAnswerFromText,
+  decodeOfferFromHash,
+  encodeAnswerText,
+  encodeOfferLink,
+} from "@/lib/signal-url";
 
 type ConnectionState = "idle" | "creating-offer" | "waiting-answer" | "connecting" | "connected";
 
@@ -26,6 +32,7 @@ export default function RoomPage() {
   const [receivedFiles, setReceivedFiles] = useState<File[]>([]);
   const [shareLink, setShareLink] = useState("");
   const [answerLink, setAnswerLink] = useState("");
+  const [answerText, setAnswerText] = useState("");
   const [copied, setCopied] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
@@ -127,6 +134,7 @@ export default function RoomPage() {
   const createRoom = useCallback(async () => {
     setState("creating-offer");
     setError("");
+    setAnswerText("");
 
     const pc = createPeerConnection();
     const dc = pc.createDataChannel("imv");
@@ -134,8 +142,9 @@ export default function RoomPage() {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+    await waitForIceGatheringComplete(pc);
 
-    const link = encodeOfferLink(window.location.origin, roomId, offer, ICE_SERVERS);
+    const link = encodeOfferLink(window.location.origin, roomId, getLocalDescription(pc), ICE_SERVERS);
     setShareLink(link);
     setState("waiting-answer");
 
@@ -168,19 +177,22 @@ export default function RoomPage() {
     }
 
     setError("");
+    setState("connecting");
     const pc = createPeerConnection(hashData.ice);
     pc.ondatachannel = (event) => setupDataChannel(event.channel);
 
     await pc.setRemoteDescription(new RTCSessionDescription(hashData.sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    await waitForIceGatheringComplete(pc);
+    const completeAnswer = getLocalDescription(pc);
 
     // Try to POST answer to API
     try {
       const res = await fetch("/api/signal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "answer", roomId, sdp: answer }),
+        body: JSON.stringify({ action: "answer", roomId, sdp: completeAnswer }),
       });
       const result = await res.json();
       if (result.stored) {
@@ -190,11 +202,33 @@ export default function RoomPage() {
       }
     } catch { /* API unavailable */ }
 
-    // Fallback: show answer link for manual copy-paste
-    const aLink = `${window.location.origin}/room/${roomId}${encodeAnswerHash(answer)}`;
-    setAnswerLink(aLink);
+    // Fallback: copy this answer back into the creator's still-open room page.
+    setAnswerLink(encodeAnswerText(completeAnswer));
     setState("connecting");
   }, [roomId, createPeerConnection, setupDataChannel]);
+
+  const applyManualAnswer = useCallback(async () => {
+    const pc = pcRef.current;
+    if (!pc) {
+      setError("Create a room before applying an answer");
+      return;
+    }
+
+    const answer = decodeAnswerFromText(answerText);
+    if (!answer) {
+      setError("Invalid answer code");
+      return;
+    }
+
+    try {
+      setError("");
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      setAnswerText("");
+      setState("connecting");
+    } catch {
+      setError("Could not apply answer code");
+    }
+  }, [answerText]);
 
   // Auto-detect role
   useEffect(() => {
@@ -277,6 +311,20 @@ export default function RoomPage() {
 
   const isConnected = state === "connected";
   const isWaiting = state === "waiting-answer";
+  const statusText = isConnected
+    ? "Connected"
+    : isWaiting
+      ? "Waiting..."
+      : state === "creating-offer"
+        ? "Preparing..."
+        : state === "connecting"
+          ? "Connecting..."
+          : "Ready";
+  const statusClass = isConnected
+    ? "text-green-400"
+    : isWaiting || state === "creating-offer" || state === "connecting"
+      ? "text-yellow-400"
+      : "text-muted-foreground";
 
   return (
     <div
@@ -296,15 +344,21 @@ export default function RoomPage() {
       <header className="h-14 border-b border-border flex items-center justify-between px-4 shrink-0">
         <h1 className="font-bold text-lg">IMV</h1>
         <div className="flex items-center gap-2">
-          <div className={`h-2 w-2 rounded-full ${isConnected ? "bg-green-400" : isWaiting ? "bg-yellow-400 animate-pulse" : "bg-muted-foreground"}`} />
-          <span className={`text-sm ${isConnected ? "text-green-400" : isWaiting ? "text-yellow-400" : "text-muted-foreground"}`}>
-            {isConnected ? "Connected" : isWaiting ? "Waiting..." : state === "connecting" ? "Connecting..." : "Ready"}
+          <div className={`h-2 w-2 rounded-full ${isConnected ? "bg-green-400" : statusClass === "text-yellow-400" ? "bg-yellow-400 animate-pulse" : "bg-muted-foreground"}`} />
+          <span className={`text-sm ${statusClass}`}>
+            {statusText}
           </span>
         </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {/* Share link for creator */}
+        {state === "creating-offer" && (
+          <div className="text-center py-20 space-y-3">
+            <p className="text-muted-foreground">Preparing a connection link...</p>
+          </div>
+        )}
+
         {isWaiting && shareLink && (
           <div className="text-center py-12 space-y-4">
             <p className="text-muted-foreground">Share this link with your peer:</p>
@@ -315,20 +369,38 @@ export default function RoomPage() {
               className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
               {copied ? "Copied!" : "Copy Link"}
             </button>
+            <div className="pt-6 space-y-3 max-w-lg mx-auto">
+              <p className="text-muted-foreground">Paste the answer code here:</p>
+              <textarea
+                value={answerText}
+                onChange={(e) => { setAnswerText(e.target.value); setError(""); }}
+                className="w-full min-h-24 rounded-lg border border-border bg-card p-3 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+              <button onClick={applyManualAnswer}
+                className="px-4 py-2 rounded-lg border border-border text-sm font-medium hover:bg-muted transition-colors">
+                Apply Answer
+              </button>
+            </div>
           </div>
         )}
 
         {/* Answer link fallback (when no Redis) */}
         {answerLink && (
           <div className="text-center py-8 space-y-4">
-            <p className="text-muted-foreground">Connection answer ready. Copy this link and send it to the creator:</p>
+            <p className="text-muted-foreground">Connection answer ready. Copy this code back to the creator:</p>
             <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono max-w-lg mx-auto">
               {answerLink}
             </div>
             <button onClick={() => copyText(answerLink)}
               className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
-              {copied ? "Copied!" : "Copy Answer Link"}
+              {copied ? "Copied!" : "Copy Answer Code"}
             </button>
+          </div>
+        )}
+
+        {state === "connecting" && !answerLink && !isConnected && (
+          <div className="text-center py-20 space-y-3">
+            <p className="text-muted-foreground">Preparing connection...</p>
           </div>
         )}
 
@@ -402,4 +474,29 @@ function formatBytes(bytes: number): string {
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+}
+
+function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 8000): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      pc.removeEventListener("icegatheringstatechange", onStateChange);
+      resolve();
+    };
+    const onStateChange = () => {
+      if (pc.iceGatheringState === "complete") cleanup();
+    };
+    const timeout = window.setTimeout(cleanup, timeoutMs);
+    pc.addEventListener("icegatheringstatechange", onStateChange);
+  });
+}
+
+function getLocalDescription(pc: RTCPeerConnection): RTCSessionDescriptionInit {
+  if (!pc.localDescription) {
+    throw new Error("Peer connection has no local description");
+  }
+
+  return pc.localDescription.toJSON();
 }
