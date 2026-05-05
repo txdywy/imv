@@ -6,10 +6,13 @@ interface RoomData {
   createdAt: number;
 }
 
-let kvInstance: unknown = undefined;
+const memoryStore = new Map<string, RoomData>();
+const isDev = process.env.NODE_ENV === "development";
+
+let kvInstance: typeof import("@vercel/kv").kv | null | undefined = undefined;
 
 async function getKV() {
-  if (kvInstance !== undefined) return kvInstance as typeof import("@vercel/kv").kv | null;
+  if (kvInstance !== undefined) return kvInstance;
   if (process.env.KV_REST_API_URL) {
     const { kv } = await import("@vercel/kv");
     kvInstance = kv;
@@ -19,12 +22,11 @@ async function getKV() {
   return null;
 }
 
-const memoryStore = new Map<string, RoomData>();
-
 async function getRoom(roomId: string) {
   const kv = await getKV();
   if (kv) return await kv.get<RoomData>(`room:${roomId}`);
-  return memoryStore.get(`room:${roomId}`) || null;
+  if (isDev) return memoryStore.get(`room:${roomId}`) || null;
+  return null;
 }
 
 export async function GET(req: NextRequest) {

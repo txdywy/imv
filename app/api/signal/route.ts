@@ -14,17 +14,18 @@ interface RoomData {
   createdAt: number;
 }
 
-// Use in-memory store for dev, KV for production
+// In-memory store for local dev only
 const memoryStore = new Map<string, RoomData>();
+const isDev = process.env.NODE_ENV === "development";
 
 // KV TTL: rooms expire after 1 hour
 const ROOM_TTL = 3600;
 
-// Cached KV instance (null = use memory store)
-let kvInstance: unknown = undefined;
+// Cached KV instance
+let kvInstance: typeof import("@vercel/kv").kv | null | undefined = undefined;
 
 async function getKV() {
-  if (kvInstance !== undefined) return kvInstance as typeof import("@vercel/kv").kv | null;
+  if (kvInstance !== undefined) return kvInstance;
   if (process.env.KV_REST_API_URL) {
     const { kv } = await import("@vercel/kv");
     kvInstance = kv;
@@ -36,17 +37,16 @@ async function getKV() {
 
 async function getRoom(roomId: string) {
   const kv = await getKV();
-  if (kv) {
-    return await kv.get<RoomData>(`room:${roomId}`);
-  }
-  return memoryStore.get(`room:${roomId}`) || null;
+  if (kv) return await kv.get<RoomData>(`room:${roomId}`);
+  if (isDev) return memoryStore.get(`room:${roomId}`) || null;
+  return null;
 }
 
 async function setRoom(roomId: string, data: RoomData) {
   const kv = await getKV();
   if (kv) {
     await kv.set(`room:${roomId}`, data, { ex: ROOM_TTL });
-  } else {
+  } else if (isDev) {
     memoryStore.set(`room:${roomId}`, data);
   }
 }

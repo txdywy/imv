@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { generateRoomId } from "@/lib/utils";
 
@@ -8,6 +8,16 @@ export default function Home() {
   const router = useRouter();
   const [roomCode, setRoomCode] = useState("");
   const [error, setError] = useState("");
+  const [storageWarning, setStorageWarning] = useState("");
+
+  useEffect(() => {
+    fetch("/api/status")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.ready) setStorageWarning("Vercel KV not configured — rooms won't persist across requests. Add KV_REST_API_URL in Vercel dashboard.");
+      })
+      .catch(() => {});
+  }, []);
 
   const createRoom = () => {
     const id = generateRoomId();
@@ -36,6 +46,11 @@ export default function Home() {
         </div>
 
         <div className="space-y-4">
+          {storageWarning && (
+            <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-200">
+              {storageWarning}
+            </div>
+          )}
           <button
             onClick={createRoom}
             className="w-full h-12 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90 transition-opacity"
