@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
+import { getRedis } from "@/lib/redis";
 
 export async function GET() {
-  const hasKV = !!process.env.KV_REST_API_URL;
+  const hasRedis = !!getRedis();
   return NextResponse.json({
-    storage: hasKV ? "kv" : "memory",
-    ready: hasKV || process.env.NODE_ENV === "development",
+    storage: hasRedis ? "redis" : "memory",
+    ready: hasRedis || process.env.NODE_ENV === "development",
   });
 }

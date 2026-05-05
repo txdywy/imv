@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getRedis } from "@/lib/redis";
 
 interface RoomData {
   messages: unknown[];
@@ -9,22 +10,9 @@ interface RoomData {
 const memoryStore = new Map<string, RoomData>();
 const isDev = process.env.NODE_ENV === "development";
 
-let kvInstance: typeof import("@vercel/kv").kv | null | undefined = undefined;
-
-async function getKV() {
-  if (kvInstance !== undefined) return kvInstance;
-  if (process.env.KV_REST_API_URL) {
-    const { kv } = await import("@vercel/kv");
-    kvInstance = kv;
-    return kv;
-  }
-  kvInstance = null;
-  return null;
-}
-
-async function getRoom(roomId: string) {
-  const kv = await getKV();
-  if (kv) return await kv.get<RoomData>(`room:${roomId}`);
+async function getRoom(roomId: string): Promise<RoomData | null> {
+  const r = getRedis();
+  if (r) return await r.get<RoomData>(`room:${roomId}`);
   if (isDev) return memoryStore.get(`room:${roomId}`) || null;
   return null;
 }
