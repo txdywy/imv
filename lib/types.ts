@@ -1,17 +1,3 @@
-export interface SignalMessage {
-  type: "offer" | "answer" | "candidate";
-  from: string;
-  to?: string;
-  data: RTCSessionDescriptionInit | RTCIceCandidateInit;
-  timestamp: number;
-}
-
-export interface RoomInfo {
-  id: string;
-  createdAt: number;
-  peers: string[];
-}
-
 export interface ChatMessage {
   id: string;
   from: string;

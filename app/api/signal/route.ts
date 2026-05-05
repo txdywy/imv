@@ -1,26 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Stateless signaling — this endpoint exists only for the POST-answer flow.
-// The offer is embedded in the URL hash. The answer is POSTed here and
-// returned via polling. Uses Upstash Redis if available, memory otherwise.
-// If neither works, the client falls back to URL-only mode (copy answer link).
+// Stateless signaling API backed by Upstash Redis when configured, with an
+// in-memory fallback for simple deployments. It stores one WebRTC offer/answer
+// pair per room id.
 
 import { getRedis } from "@/lib/redis";
 
 interface SignalData {
+  offer?: unknown;
   answer?: unknown;
-  candidates?: unknown[];
+  expiresAt?: number;
 }
 
 const memoryStore = new Map<string, SignalData>();
-const isDev = process.env.NODE_ENV === "development";
 const SIGNAL_TTL = 300;
 
 async function getData(roomId: string): Promise<SignalData | null> {
   const r = getRedis();
   if (r) return await r.get<SignalData>(`sig:${roomId}`);
-  if (isDev) return memoryStore.get(`sig:${roomId}`) || null;
-  return null;
+
+  const key = `sig:${roomId}`;
+  const data = memoryStore.get(key);
+  if (!data) return null;
+  if (data.expiresAt && data.expiresAt < Date.now()) {
+    memoryStore.delete(key);
+    return null;
+  }
+  return data;
 }
 
 async function setData(roomId: string, data: SignalData): Promise<boolean> {
@@ -28,11 +34,13 @@ async function setData(roomId: string, data: SignalData): Promise<boolean> {
   if (r) {
     await r.set(`sig:${roomId}`, data, { ex: SIGNAL_TTL });
     return true;
-  } else if (isDev) {
-    memoryStore.set(`sig:${roomId}`, data);
-    return true;
   }
-  return false;
+
+  memoryStore.set(`sig:${roomId}`, {
+    ...data,
+    expiresAt: Date.now() + SIGNAL_TTL * 1000,
+  });
+  return true;
 }
 
 export async function POST(req: NextRequest) {
@@ -43,16 +51,25 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "roomId required" }, { status: 400 });
   }
 
-  if (action === "answer") {
-    const stored = await setData(roomId, { answer: body.sdp, candidates: [] });
+  if (action === "offer") {
+    const existing = await getData(roomId);
+    if (existing?.offer && !existing.answer) {
+      return NextResponse.json({ error: "Room already has a waiting peer" }, { status: 409 });
+    }
+
+    const stored = await setData(roomId, { offer: body.sdp });
+    if (!stored) {
+      return NextResponse.json({ error: "Signaling store unavailable" }, { status: 503 });
+    }
     return NextResponse.json({ ok: true, stored });
   }
 
-  if (action === "candidate") {
+  if (action === "answer") {
     const data = (await getData(roomId)) || {};
-    if (!data.candidates) data.candidates = [];
-    data.candidates.push(body.candidate);
-    const stored = await setData(roomId, data);
+    const stored = await setData(roomId, { ...data, answer: body.sdp });
+    if (!stored) {
+      return NextResponse.json({ error: "Signaling store unavailable" }, { status: 503 });
+    }
     return NextResponse.json({ ok: true, stored });
   }
 
@@ -64,13 +81,9 @@ export async function GET(req: NextRequest) {
   if (!roomId) return NextResponse.json({ error: "roomId required" }, { status: 400 });
 
   const data = await getData(roomId);
-  if (!data) return NextResponse.json({});
-
-  // Return and clear candidates
-  const result: SignalData = { ...data };
-  if (data.candidates?.length) {
-    data.candidates = [];
-    await setData(roomId, data);
+  if (!data) {
+    return NextResponse.json({});
   }
-  return NextResponse.json(result);
+
+  return NextResponse.json(data);
 }

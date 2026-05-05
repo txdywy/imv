@@ -15,12 +15,12 @@ export default function Home() {
   };
 
   const joinRoom = () => {
-    const code = roomCode.trim().toUpperCase();
-    if (code.length !== 6) {
-      setError("Enter a 6-character room code");
+    const code = roomCode.trim();
+    if (!code) {
+      setError("Enter a room id");
       return;
     }
-    router.push(`/room/${code}`);
+    router.push(`/room/${encodeURIComponent(code)}`);
   };
 
   return (
@@ -56,12 +56,11 @@ export default function Home() {
             <div className="flex gap-2">
               <input
                 type="text"
-                placeholder="Room code"
+                placeholder="Room id"
                 value={roomCode}
-                onChange={(e) => { setRoomCode(e.target.value.toUpperCase()); setError(""); }}
+                onChange={(e) => { setRoomCode(e.target.value); setError(""); }}
                 onKeyDown={(e) => e.key === "Enter" && joinRoom()}
-                maxLength={6}
-                className="flex-1 h-12 rounded-lg border border-border bg-card px-4 text-center text-lg font-mono tracking-widest placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-ring"
+                className="flex-1 h-12 rounded-lg border border-border bg-card px-4 text-center text-lg font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-ring"
               />
               <button onClick={joinRoom}
                 className="h-12 px-6 rounded-lg border border-border font-medium hover:bg-muted transition-colors">
