@@ -29,8 +29,6 @@ export default function RoomPage() {
   const [copied, setCopied] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
-  const [isJoiner, setIsJoiner] = useState(false);
-
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const ftRef = useRef<FileTransferManager | null>(null);
@@ -208,20 +206,22 @@ export default function RoomPage() {
     });
     ftRef.current = ft;
 
-    // Check if there's an answer in the hash (creator received answer link)
-    const answer = decodeAnswerFromHash(window.location.hash);
-    if (answer && pcRef.current) {
-      pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-      setState("connecting");
-      return;
-    }
+    const startupTimer = window.setTimeout(() => {
+      // Check if there's an answer in the hash (creator received answer link)
+      const answer = decodeAnswerFromHash(window.location.hash);
+      if (answer && pcRef.current) {
+        pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+        setState("connecting");
+        return;
+      }
 
-    if (window.location.hash.startsWith("#offer=")) {
-      setIsJoiner(true);
-      joinRoom();
-    }
+      if (window.location.hash.startsWith("#offer=")) {
+        void joinRoom();
+      }
+    }, 0);
 
     return () => {
+      window.clearTimeout(startupTimer);
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [joinRoom, updateProgress, handleFileReady]);
@@ -333,7 +333,7 @@ export default function RoomPage() {
         )}
 
         {/* Idle state */}
-        {state === "idle" && !isJoiner && (
+        {state === "idle" && (
           <div className="text-center py-20 space-y-4">
             <p className="text-muted-foreground">Create a room to start chatting</p>
             <button onClick={createRoom}

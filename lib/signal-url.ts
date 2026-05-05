@@ -7,7 +7,7 @@ export function encodeSignal(sdp: RTCSessionDescriptionInit): string {
 }
 
 export function decodeSignal(encoded: string): RTCSessionDescriptionInit {
-  const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  const base64 = toBase64(encoded);
   return JSON.parse(atob(base64));
 }
 
@@ -33,8 +33,7 @@ export function decodeOfferFromHash(hash: string): {
   const match = hash.match(/^#offer=(.+)$/);
   if (!match) return null;
   try {
-    const base64 = match[1].replace(/-/g, "+").replace(/_/g, "/");
-    return JSON.parse(atob(base64));
+    return JSON.parse(atob(toBase64(match[1])));
   } catch {
     return null;
   }
@@ -52,9 +51,13 @@ export function decodeAnswerFromHash(hash: string): RTCSessionDescriptionInit | 
   const match = hash.match(/^#answer=(.+)$/);
   if (!match) return null;
   try {
-    const base64 = match[1].replace(/-/g, "+").replace(/_/g, "/");
-    return JSON.parse(atob(base64));
+    return JSON.parse(atob(toBase64(match[1])));
   } catch {
     return null;
   }
+}
+
+function toBase64(encoded: string): string {
+  const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  return base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
 }
