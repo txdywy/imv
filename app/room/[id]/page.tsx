@@ -260,6 +260,9 @@ export default function RoomPage() {
 
   const isConnected = state === "connected";
   const isWaiting = state === "waiting-answer";
+  const roomUrl = typeof window === "undefined"
+    ? ""
+    : `${window.location.origin}/room/${encodeURIComponent(roomId)}`;
   const statusText = isConnected
     ? "Connected"
     : isWaiting
@@ -309,13 +312,13 @@ export default function RoomPage() {
 
         {isWaiting && (
           <div className="text-center py-12 space-y-4">
-            <p className="text-muted-foreground">Waiting for someone to join room:</p>
-            <div className="bg-card border border-border rounded-lg p-4 break-all text-lg font-mono max-w-lg mx-auto">
-              {roomId}
+            <p className="text-muted-foreground">Share this link to invite someone:</p>
+            <div className="bg-card border border-border rounded-lg p-4 break-all text-sm font-mono max-w-lg mx-auto">
+              {roomUrl}
             </div>
-            <button onClick={() => copyText(roomId)}
+            <button onClick={() => copyText(roomUrl)}
               className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
-              {copied ? "Copied!" : "Copy Room ID"}
+              {copied ? "Copied!" : "Copy Invite Link"}
             </button>
           </div>
         )}
