@@ -6,13 +6,6 @@ import { nanoid } from "nanoid";
 import { FileTransferManager } from "@/lib/file-transfer";
 import type { ChatMessage, FileTransferProgress } from "@/lib/types";
 import { playNotification } from "@/lib/sound";
-import {
-  decodeAnswerFromHash,
-  decodeAnswerFromText,
-  decodeOfferFromHash,
-  encodeAnswerText,
-  encodeOfferLink,
-} from "@/lib/signal-url";
 
 type ConnectionState = "idle" | "creating-offer" | "waiting-answer" | "connecting" | "connected";
 
@@ -30,9 +23,6 @@ export default function RoomPage() {
   const [inputText, setInputText] = useState("");
   const [fileProgress, setFileProgress] = useState<Map<string, FileTransferProgress>>(new Map());
   const [receivedFiles, setReceivedFiles] = useState<File[]>([]);
-  const [shareLink, setShareLink] = useState("");
-  const [answerLink, setAnswerLink] = useState("");
-  const [answerText, setAnswerText] = useState("");
   const [copied, setCopied] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
@@ -74,8 +64,6 @@ export default function RoomPage() {
     channel.binaryType = "arraybuffer";
     channel.onopen = () => {
       setState("connected");
-      setShareLink("");
-      setAnswerLink("");
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       addMessage({
         id: nanoid(8), from: "system",
@@ -112,29 +100,38 @@ export default function RoomPage() {
     const pc = new RTCPeerConnection({ iceServers: iceServers || ICE_SERVERS });
     pcRef.current = pc;
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        // Try to store candidate via API (best effort)
-        fetch("/api/signal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "candidate", roomId, candidate: event.candidate.toJSON() }),
-        }).catch(() => {});
-      }
-    };
-
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") setState("connected");
     };
 
     return pc;
+  }, []);
+
+  const pollForAnswer = useCallback((pc: RTCPeerConnection) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/signal?roomId=${encodeURIComponent(roomId)}`);
+        const data = await r.json();
+        if (!r.ok) {
+          setError(data.error || "Signaling server unavailable");
+          return;
+        }
+        if (data.answer) {
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+          setState("connecting");
+        }
+      } catch {
+        setError("Could not reach signaling server");
+      }
+    }, 1000);
   }, [roomId]);
 
-  // Creator: create offer, show share link, poll for answer
+  // First peer in a room: create offer, store it, poll for answer.
   const createRoom = useCallback(async () => {
     setState("creating-offer");
     setError("");
-    setAnswerText("");
 
     const pc = createPeerConnection();
     const dc = pc.createDataChannel("imv");
@@ -144,93 +141,75 @@ export default function RoomPage() {
     await pc.setLocalDescription(offer);
     await waitForIceGatheringComplete(pc);
 
-    const link = encodeOfferLink(window.location.origin, roomId, getLocalDescription(pc), ICE_SERVERS);
-    setShareLink(link);
-    setState("waiting-answer");
-
-    // Poll for answer (works if Redis is configured)
-    pollRef.current = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/signal?roomId=${roomId}`);
-        const data = await r.json();
-        if (data.answer) {
-          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-          setState("connecting");
-        }
-        // Also poll ICE candidates
-        if (data.candidates?.length) {
-          for (const c of data.candidates) {
-            await pc.addIceCandidate(new RTCIceCandidate(c));
-          }
-        }
-      } catch { /* keep polling */ }
-    }, 1000);
-  }, [roomId, createPeerConnection, setupDataChannel]);
-
-  // Joiner: extract offer from URL, create answer
-  const joinRoom = useCallback(async () => {
-    const hashData = decodeOfferFromHash(window.location.hash);
-    if (!hashData) {
-      setError("No offer found in URL");
+    const res = await fetch("/api/signal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "offer", roomId, sdp: getLocalDescription(pc) }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.stored) {
+      pc.close();
+      setState("idle");
+      setError(result.error || "Signaling server unavailable");
       return;
     }
 
+    setState("waiting-answer");
+    pollForAnswer(pc);
+  }, [roomId, createPeerConnection, setupDataChannel, pollForAnswer]);
+
+  // Second peer in a room: consume offer and store answer.
+  const joinRoom = useCallback(async (offerSdp: RTCSessionDescriptionInit) => {
     setError("");
     setState("connecting");
-    const pc = createPeerConnection(hashData.ice);
+    const pc = createPeerConnection();
     pc.ondatachannel = (event) => setupDataChannel(event.channel);
 
-    await pc.setRemoteDescription(new RTCSessionDescription(hashData.sdp));
+    await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await waitForIceGatheringComplete(pc);
     const completeAnswer = getLocalDescription(pc);
 
-    // Try to POST answer to API
-    try {
-      const res = await fetch("/api/signal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "answer", roomId, sdp: completeAnswer }),
-      });
-      const result = await res.json();
-      if (result.stored) {
-        // API stored the answer — creator will poll it
-        setState("connecting");
-        return;
-      }
-    } catch { /* API unavailable */ }
-
-    // Fallback: copy this answer back into the creator's still-open room page.
-    setAnswerLink(encodeAnswerText(completeAnswer));
-    setState("connecting");
+    const res = await fetch("/api/signal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "answer", roomId, sdp: completeAnswer }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.stored) {
+      pc.close();
+      setState("idle");
+      setError(result.error || "Signaling server unavailable");
+    }
   }, [roomId, createPeerConnection, setupDataChannel]);
 
-  const applyManualAnswer = useCallback(async () => {
-    const pc = pcRef.current;
-    if (!pc) {
-      setError("Create a room before applying an answer");
-      return;
-    }
-
-    const answer = decodeAnswerFromText(answerText);
-    if (!answer) {
-      setError("Invalid answer code");
-      return;
-    }
-
+  const enterRoom = useCallback(async () => {
     try {
-      setError("");
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      setAnswerText("");
       setState("connecting");
-    } catch {
-      setError("Could not apply answer code");
-    }
-  }, [answerText]);
+      setError("");
+      const res = await fetch(`/api/signal?roomId=${encodeURIComponent(roomId)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setState("idle");
+        setError(data.error || "Signaling server unavailable");
+        return;
+      }
 
-  // Auto-detect role
+      if (data.offer && !data.answer) {
+        await joinRoom(data.offer);
+      } else if (data.offer && data.answer) {
+        setState("idle");
+        setError("This room is already connected. Use another room id.");
+      } else {
+        await createRoom();
+      }
+    } catch {
+      setState("idle");
+      setError("Could not reach signaling server");
+    }
+  }, [roomId, createRoom, joinRoom]);
+
   useEffect(() => {
     const ft = new FileTransferManager({
       send: (data) => { dcRef.current?.send(data); return true; },
@@ -241,45 +220,15 @@ export default function RoomPage() {
     ftRef.current = ft;
 
     const startupTimer = window.setTimeout(() => {
-      // Check if there's an answer in the hash (creator received answer link)
-      const answer = decodeAnswerFromHash(window.location.hash);
-      if (answer && pcRef.current) {
-        pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-        setState("connecting");
-        return;
-      }
-
-      if (window.location.hash.startsWith("#offer=")) {
-        void joinRoom();
-      }
+      void enterRoom();
     }, 0);
 
     return () => {
       window.clearTimeout(startupTimer);
       if (pollRef.current) clearInterval(pollRef.current);
+      pcRef.current?.close();
     };
-  }, [joinRoom, updateProgress, handleFileReady]);
-
-  // Poll for ICE candidates when connecting
-  useEffect(() => {
-    if (state !== "waiting-answer" && state !== "connecting") return;
-    const pc = pcRef.current;
-    if (!pc) return;
-
-    const poll = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/signal?roomId=${roomId}`);
-        const data = await r.json();
-        if (data.candidates?.length) {
-          for (const c of data.candidates) {
-            await pc.addIceCandidate(new RTCIceCandidate(c));
-          }
-        }
-      } catch { /* keep polling */ }
-    }, 1000);
-
-    return () => clearInterval(poll);
-  }, [state, roomId]);
+  }, [enterRoom, updateProgress, handleFileReady]);
 
   const sendMessage = () => {
     const text = inputText.trim();
@@ -352,65 +301,37 @@ export default function RoomPage() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        {/* Share link for creator */}
         {state === "creating-offer" && (
           <div className="text-center py-20 space-y-3">
-            <p className="text-muted-foreground">Preparing a connection link...</p>
+            <p className="text-muted-foreground">Creating room {roomId}...</p>
           </div>
         )}
 
-        {isWaiting && shareLink && (
+        {isWaiting && (
           <div className="text-center py-12 space-y-4">
-            <p className="text-muted-foreground">Share this link with your peer:</p>
-            <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono max-w-lg mx-auto">
-              {shareLink}
+            <p className="text-muted-foreground">Waiting for someone to join room:</p>
+            <div className="bg-card border border-border rounded-lg p-4 break-all text-lg font-mono max-w-lg mx-auto">
+              {roomId}
             </div>
-            <button onClick={() => copyText(shareLink)}
+            <button onClick={() => copyText(roomId)}
               className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
-              {copied ? "Copied!" : "Copy Link"}
-            </button>
-            <div className="pt-6 space-y-3 max-w-lg mx-auto">
-              <p className="text-muted-foreground">Paste the answer code here:</p>
-              <textarea
-                value={answerText}
-                onChange={(e) => { setAnswerText(e.target.value); setError(""); }}
-                className="w-full min-h-24 rounded-lg border border-border bg-card p-3 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-              <button onClick={applyManualAnswer}
-                className="px-4 py-2 rounded-lg border border-border text-sm font-medium hover:bg-muted transition-colors">
-                Apply Answer
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Answer link fallback (when no Redis) */}
-        {answerLink && (
-          <div className="text-center py-8 space-y-4">
-            <p className="text-muted-foreground">Connection answer ready. Copy this code back to the creator:</p>
-            <div className="bg-card border border-border rounded-lg p-4 break-all text-xs font-mono max-w-lg mx-auto">
-              {answerLink}
-            </div>
-            <button onClick={() => copyText(answerLink)}
-              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90">
-              {copied ? "Copied!" : "Copy Answer Code"}
+              {copied ? "Copied!" : "Copy Room ID"}
             </button>
           </div>
         )}
 
-        {state === "connecting" && !answerLink && !isConnected && (
+        {state === "connecting" && !isConnected && (
           <div className="text-center py-20 space-y-3">
-            <p className="text-muted-foreground">Preparing connection...</p>
+            <p className="text-muted-foreground">Connecting to room {roomId}...</p>
           </div>
         )}
 
-        {/* Idle state */}
         {state === "idle" && (
           <div className="text-center py-20 space-y-4">
-            <p className="text-muted-foreground">Create a room to start chatting</p>
-            <button onClick={createRoom}
+            <p className="text-muted-foreground">Could not enter room {roomId}</p>
+            <button onClick={enterRoom}
               className="px-6 py-3 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90">
-              Create Room
+              Retry
             </button>
           </div>
         )}
